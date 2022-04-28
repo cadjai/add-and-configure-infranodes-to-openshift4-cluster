@@ -1,0 +1,48 @@
+---
+- name: '{{ ansible_name_module }} | Retrieve Infrastructure ID'
+  command: >
+    {{ openshift_cli }} get -o jsonpath='{.status.infrastructureName}{"\n"}' \
+       infrastructure cluster
+  register: cluster_infra_id
+
+- name: '{{ ansible_name_module }} | template | Copy Infranode machineset template to staging location'
+  template:
+    src: "templates/infranode-machineset.yml.j2"
+    dest: "{{ staging_dir | d('/tmp', true) }}/{{ item.key }}-infranode-machineset.yml"
+  vars:
+    infra_id: "{{ cluster_infra_id.stdout }}"
+    aws_region: "{{ item.value.aws_region | d('us-east-1') }}"
+    aws_az: "{{ item.value.aws_az | d('a') }}"
+    node_sg: "{{ item.value.sg | d('worker') }}"
+    node_profile: "{{ item.value.profile | d('worker') }}"
+    node_role: "{{ item.value.role | d('worker') }}"
+    node_type: "{{ item.value.type | d('worker') }}"
+    node_replica_count: "{{ item.value.replicat_count | d('1') }}"
+    node_ami: "{{ item.value.ami | d('ami-0d5f9982f029fbc14',true) }}"
+    node_block_size: "{{ item.value.block_size | d('120') }}"
+    node_volume_type: "{{ item.value.volume_type | d('gp2') }}"
+    node_instance_type: "{{ item.value.instance_type | d('m5.4xlarge') }}"
+  with_dict: "{{ infranodes }}"
+  loop_control:
+    index_var: key_cnt
+  when:
+    - item.key is defined and item.key != ""
+    - item.value.aws_az is defined and item.value.aws_az != ""
+    - item.value.aws_region is defined and item.value.aws_region != ""
+  register: infra_mahineset_config_copied
+
+- name: '{{ ansible_name_module }} | command:{{ openshift_cli }} apply | deploy infra machinesets '
+  command: >
+    {{ openshift_cli }} apply -f {{ staging_dir | d('/tmp', true) }}/{{ item.key }}-infranode-machineset.yml
+  with_dict: "{{ infranodes }}"
+  loop_control:
+    index_var: key_cnt
+  when:
+    - item.key is defined and item.key != ""
+    - item.value.aws_az is defined and item.value.aws_az != ""
+    - item.value.aws_region is defined and item.value.aws_region != ""
+
+- name: '{{ ansible_name_module }} | wait_for | wait for machine to be created'
+  wait_for:
+    timeout: 300
+  delegate_to: localhost
