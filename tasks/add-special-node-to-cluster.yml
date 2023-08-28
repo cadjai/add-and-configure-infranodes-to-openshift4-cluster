@@ -1,0 +1,130 @@
+- name: '{{ ansible_name_module }} | assert | specialworkernode.requester is defined'
+  assert:
+    that:
+      - specialworkernode.requester is defined
+      - specialworkernode.requester != '' 
+    msg: "specialworkernode.requester is required so we can assing the workload node to a tenant"
+
+- name: '{{ ansible_name_module }} | assert | specialworkernode.taint_key is defined'
+  assert:
+    that:
+      - specialworkernode.taint_key is defined
+      - specialworkernode.taint_key != '' 
+    msg: "specialworkernode.requester is required so we can assing the workload node to a tenant"
+
+- name: '{{ ansible_name_module }} | Retrieve Infrastructure ID'
+  command: >
+    {{ openshift_cli }} get -o jsonpath='{.status.infrastructureName}{"\n"}' \
+       infrastructure cluster
+  register: cluster_infra_id
+
+- name: '{{ ansible_name_module }} | Retrieve Infrastructure Region'
+  command: >
+    {{ openshift_cli }} get -o jsonpath='{.status.platformStatus.aws.region}{"\n"}' \
+       infrastructure cluster
+  register: cluster_aws_region
+
+- name: '{{ ansible_name_module }} | Retrieve Infrastructure VPC'
+  command: >
+    {{ openshift_cli }} get machine {{ cluster_infra_id.stdout }}-master-0 -n openshift-machine-api -o jsonpath='{.spec.providerSpec.value.subnet.filters[0].values[0]}{"\n"}'
+  register: cluster_aws_vpc_subnet
+
+- name: '{{ ansible_name_module }} | Set special node region subnet'
+  set_fact:
+    aws_region: "{{ specialworkernode.instance_az if  specialworkernode.instance_az is defined and  specialworkernode.instance_az != '' else cluster_aws_region.stdout }}"
+    aws_node_subnet: "{{ specialworkernode.instance_subnet if  specialworkernode.instance_subnet is defined and  specialworkernode.instance_subnet != '' else cluster_aws_vpc_subnet.stdout }}"
+
+- name: '{{ ansible_name_module }} | template | Copy specialworkernode.machineset template to staging location'
+  template:
+    src: "templates/special-worker-node-machineset.yml.j2"
+    dest: "{{ staging_dir | d('/tmp', true) }}/{{ node_owner }}-az{{ specialworkernode.instance_az | d(aws_zones[0], true) }}-special-worker-node-machineset.yml"
+    force: yes
+  vars:
+    infra_id: "{{ cluster_infra_id.stdout }}"
+    aws_az: "{{ specialworkernode.instance_az | d(aws_zones[0], true) }}"
+    node_sg: "{{ specialworkernode.sg | d('worker', true) }}"
+    node_profile: "{{ specialworkernode.profile | d('worker', true) }}"
+    node_role: "{{ specialworkernode.role | d('worker', true) }}"
+    node_type: "{{ specialworkernode.type | d('worker', true) }}"
+    node_replica_count: "{{ specialworkernode.node_count | default('1', true) }}"
+    node_ami: "{{ specialworkernode.ami | d('ami-0c14637fd34c78ae8',true) }}"
+    node_block_size: "{{ specialworkernode.block_size | d('120', true) }}"
+    node_volume_type: "{{ specialworkernode.volume_type | d('gp2', true) }}"
+    node_instance_type: "{{ specialworkernode.instance_type | d('g4dn.xlarge', true) }}"
+    node_gpu_count: "{{ specialworkernode.gpu_count | d('0', true) }}"
+    node_memory_size: "{{ specialworkernode.mem_size | d('0', true) }}"
+    node_cpu_count: "{{ specialworkernode.cpu_count | d('0', true) }}"
+    node_owner: "{{ specialworkernode.requester }}"
+    node_env: "{{ specialworkernode.env | d('dev', true) }}"
+    node_taint_value: "{{ specialworkernode.taint_value | d('reserved', true) }}"
+    node_taint_key: "{{ specialworkernode.taint_key }}"
+  register: swnode_machineset_config_copied
+
+- name: '{{ ansible_name_module }} | command:{{ openshift_cli }} apply | deploy special worker node machinesets '
+  vars:
+    node_owner: "{{ specialworkernode.requester }}"
+  command: >
+    {{ openshift_cli }} apply -f {{ staging_dir | d('/tmp', true) }}/{{ node_owner }}-az{{ specialworkernode.instance_az | d(aws_zones[0], true) }}-special-worker-node-machineset.yml 
+  register: swnode_machineset_created
+
+- name: '{{ ansible_name_module }} | wait_for | wait for machine to be created'
+  wait_for:
+    timeout: 450
+  delegate_to: localhost
+
+## To properly function and reduce cost associated with these special worker  resources we will use the cluster autoscaler to manage the machine autoscaler associated with each special worker node  deployment
+- name: '{{ ansible_name_module }} | block | Ensure The cluster autoscaler is enabled'
+  when:
+    - add_node_to_autoscaler is defined
+    - add_node_to_autoscaler | bool 
+  block:
+    - name: '{{ ansible_name_module }} | Check if  ClusterAutoscaler exist'
+      command: >
+        {{ openshift_cli }} get  clusterautoscalers.autoscaling.openshift.io default
+      ignore_errors: yes
+      register: clusterautoscaler_test
+
+    - name: '{{ ansible_name_module }} | template | Copy Cluster Autoscaler template to staging location'
+      template:
+        src: "../cluster_post-install_day_two/templates/clusterautoscaler.yml.j2"
+        dest: "{{ staging_dir | d('/tmp', true) }}/clusterautoscaler.yml"
+        force: yes
+      when:
+        - clusterautoscaler_test is defined 
+        - clusterautoscaler_test.rc is defined 
+        - clusterautoscaler_test.rc != "0"
+        - clusterautoscaler_test.stderr is defined 
+        - '" not found" in clusterautoscaler_test.stderr ' 
+      register: clusterautoscaler_config_copied
+
+    - name: '{{ ansible_name_module }} | command:{{ openshift_cli }} apply | deploy cluster autoscaler '
+      command: >
+        {{ openshift_cli }} apply -f {{ staging_dir | d('/tmp', true) }}/clusterautoscaler.yml
+      when:
+        - clusterautoscaler_config_copied is defined
+        - clusterautoscaler_config_copied.dest is defined
+        - clusterautoscaler_config_copied.dest != ""
+      register: clusterautoscaler_config_deployed
+
+    - name: '{{ ansible_name_module }} | template | Copy specialworkernode.machine autoscaler template to staging location'
+      template:
+        src: "templates/special-worker-node-machineautoscaler.yml.j2"
+        dest: "{{ staging_dir | d('/tmp', true) }}/{{ node_owner }}-az{{ specialworkernode.instance_az | d(aws_zones[0], true) }}-special-worker-node-machineautoscaler.yml"
+        force: yes
+      vars:
+        infra_id: "{{ cluster_infra_id.stdout }}"
+        aws_az: "{{ specialworkernode.instance_az | d(aws_zones[0], true) }}"
+        node_role: "{{ specialworkernode.role | d('worker', true) }}"
+        node_owner: "{{ specialworkernode.requester }}"
+        machineset_name: "{{ infra_id }}-{{ node_role }}-{{ node_owner }}-{{ aws_region }}{{ aws_az }}"
+        node_replica_count: "{{ specialworkernode.node_count | default('1', true) }}"
+        machine_autoscaler_replica_min: 0
+        machine_autoscaler_replica_max: "{{ node_replica_count }}"
+      register: swnode_machine_autoscaler_config_copied
+
+    - name: '{{ ansible_name_module }} | command:{{ openshift_cli }} apply | deploy special worker node machine autoscaler '
+      vars:
+        node_owner: "{{ specialworkernode.requester }}"
+      command: >
+        {{ openshift_cli }} apply -f {{ staging_dir | d('/tmp', true) }}/{{ node_owner }}-az{{ specialworkernode.instance_az | d(aws_zones[0], true) }}-special-worker-node-machineautoscaler.yml 
+      register: swnode_machine_autoscaler_created
