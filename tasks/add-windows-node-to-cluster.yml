@@ -1,0 +1,245 @@
+- name: '{{ ansible_name_module }} | Ensure required variables are set'
+  block:
+    - ansible.builtin.assert:
+        that:
+          - windowsnode.is defined and windowsnode.!= ""
+        msg: " the windowsnode.structure must be set and valid "
+    - ansible.builtin.assert:
+        that:
+          - windowsnode.role is defined and windowsnode.role != ""
+        msg: " the windowsnode.role must be set and valid "
+    - ansible.builtin.assert:
+        that:
+          - (windowsnode.instance_az is defined and windowsnode.instance_az != "") or ( aws_zones is defined and aws_zones | length > 0) 
+        msg: " the windowsnode.instance_az must be set and valid or  the aws_zones structure must be set and valid"
+    - ansible.builtin.assert:
+        that:
+          - windowsnode.ami is defined and windowsnode.ami != ""
+        msg: " the windowsnode.ami must be set and valid "
+
+    - name: '{{ ansible_name_module }} | ansible.builtin.shell:{{ openshift_cli }} get | get WMCO subscription cr'
+      ansible.builtin.shell: >
+        {{ openshift_cli }} get sub -A --no-headers | grep windows | awk '{print $2}'
+      ignore_errors: true
+      register: wmco_sub_exists
+
+    - name: '{{ ansible_name_module }} | ansible.builtin.shell:{{ openshift_cli }} get | get WMCO subscription cr namespace'
+      ansible.builtin.shell: >
+        {{ openshift_cli }} get sub -A --no-headers | grep windows | awk '{print $1}'
+      ignore_errors: true
+      register: wmco_sub_ns
+
+    - name: '{{ ansible_name_module }} | ansible.builtin.shell:{{ openshift_cli }} get | get WMCO namespace'
+      ansible.builtin.shell: >
+        {{ openshift_cli }} get project {{ wmco_ns }} --no-headers | awk '{print $1}'
+      ignore_errors: true
+      register: wmco_ns
+
+    - name: '{{ ansible_name_module }} | assert | WMCO is properly installed'
+      ansible.builtin.assert:
+        that:
+          - wmco_sub_exists is defined
+          - wmco_sub_exists.rc is defined
+          - wmco_sub_exists.rc == 0
+          - wmco_sub_exists.stdout is defined
+          - "'devspaces' in wmco_sub_exists.stdout"
+        msg: "The WMCO operator is required before running this"
+
+- name: '{{ ansible_name_module }} | Generate SSH key for windows nodes'
+  block:
+    - name: '{{ ansible_name_module }} | ssh | file:directory | Create Directory Structure'
+      ansible.builtin.file:
+        path: '{{ item }}'
+        state: directory
+        mode: '0644'
+      with_items:
+        - '{{ ssh_key_dir }}/ssh'
+
+    - name: '{{ ansible_name_module }} | ssh | openssh_keypair | Generate CloudCtl SSH Key Pair'
+      community.crypto.openssh_keypair:
+        path: "{{ ssh_key_dir }}/ssh/{{ ssh_key_name }}"
+        type: 'ed25519'
+        comment: "core@ocp.kubeadmin"
+      register: ssh_key_created 
+
+    - name: '{{ ansible_name_module }} | Get Existing RHBK KS secret'
+      ansible.builtin.command: >
+        {{ openshift_cli }} get secret {{ ssh_key_secret }} -n {{ wmco_ns }}
+      ignore_errors: yes
+      register: wmco_ssh_key_secret_exist
+
+    - name: '{{ ansible_name_module }} | create RHBK KS secret'
+      ansible.builtin.command: >
+        {{ openshift_cli }} create secret generic {{ ssh_key_secret }} \
+          --from-file=private-key.pem={{ ssh_key_dir }}/ssh/{{ ssh_key_name }} -n {{ wmco_ns }}
+      when:
+        - wmco_ssh_key_secret_exist.rc is defined
+        - wmco_ssh_key_secret_exist.rc != 0
+      register: wmco_ssh_key_secret_created
+
+- name: '{{ ansible_name_module }} | Retrieve Infrastructure ID'
+  ansible.builtin.command: >
+    {{ openshift_cli }} get -o jsonpath='{.status.infrastructureName}{"\n"}' \
+       infrastructure cluster
+  register: cluster_windowsnode_id
+
+- name: '{{ ansible_name_module }} | Retrieve Infrastructure Region'
+  ansible.builtin.command: >
+    {{ openshift_cli }} get -o jsonpath='{.status.platformStatus.aws.region}{"\n"}' \
+       infrastructure cluster
+  register: cluster_aws_region
+
+- name: '{{ ansible_name_module }} | set_fact | set windows node label'
+  ansible.builtin.set_fact:
+    windowsnode_label: "{{ windowsnode.role }}"
+
+- name:  '{{ ansible_name_module }} | Set unique availability zones facts | set_fact'
+  ansible.builtin.set_fact:
+    unique_aws_zones: "{{ aws_zones | unique }}"
+
+- name:  '{{ ansible_name_module }} | Set missing nodes count facts | set_fact'
+  ansible.builtin.set_fact:
+    missing_node_machine_count: "{{ ((aws_zones | length | int)  - (unique_aws_zones | length | int)) }}"
+    windowsnode_replica_count_per_az: "{{ ((windowsnode.instance_count | int) / (aws_zones | length | int)) | int }}"
+    total_windowsnode_az_one: "{{ (((windowsnode.instance_count | int) / (aws_zones | length | int)) + ((aws_zones | length | int)  - (unique_aws_zones | length | int))) | int }}"
+
+- name: '{{ ansible_name_module }} | Retrieve worker Instance Profile name'
+  ansible.builtin.shell: >
+    {{ openshift_cli }} get machine $({{ openshift_cli }} get machine --no-headers -n openshift-machine-api | grep infra | head -n+1 | awk '{print $1}') -n openshift-machine-api -o jsonpath='{.spec.providerSpec.value.iamInstanceProfile.id}{"\n"}'
+  register: cluster_aws_worker_profile
+
+- name: '{{ ansible_name_module }} | Retrieve Infrastructure VPC'
+  ansible.builtin.command: >
+    {{ openshift_cli }} get machine {{ cluster_windowsnode_id.stdout }}-master-0 -n openshift-machine-api -o jsonpath='{.spec.providerSpec.value.subnet.filters[0].values[0]}{"\n"}'
+  register: cluster_aws_vpc_subnet
+
+- name: '{{ ansible_name_module }} | Set special node region subnet'
+  ansible.builtin.set_fact:
+    aws_region: "{{ windowsnode.instance_az if  windowsnode.instance_az is defined and  windowsnode.instance_az != '' else cluster_aws_region.stdout }}"
+    aws_node_profile: "{{ windowsnode.profile if windowsnode.profile is defined and windowsnode.profile != '' else cluster_aws_worker_profile.stdout }}"
+
+- name: '{{ ansible_name_module }} | template | Copy windowsnode.machineset template to staging location'
+  ansible.builtin.template:
+    src: "templates/windows-worker-node-machineset.yml.j2"
+    dest: "{{ staging_dir | d('/tmp', true) }}/windows-az{{ key_cnt }}-node-machineset.yml"
+    force: yes
+  vars:
+    infra_id: "{{ cluster_windowsnode_id.stdout }}"
+    aws_az: "{{ aws_zones[key_cnt] }}"
+    aws_node_subnet: "{{ cluster_aws_vpc_subnet.stdout[:-1] }}{{ aws_zones[key_cnt] }}"
+    node_sg: "{{ windowsnode.sg | d('worker', true) }}"
+    node_profile: "{{ aws_node_profile }}"
+    node_role: "{{ windowsnode.role | d('worker', true) }}"
+    node_type: "{{ windowsnode.type | d('worker', true) }}"
+    node_replica_count: "{{ windowsnode.node_count | default('1', true) }}"
+    node_ami: "{{ windowsnode.ami | d('ami-0dd351da1e7c9fdc1',true) }}"
+    node_block_size: "{{ windowsnode.block_size | d('120', true) }}"
+    node_volume_type: "{{ windowsnode.volume_type | d('gp2', true) }}"
+    node_instance_type: "{{ windowsnode.instance_type | d('g4dn.xlarge', true) }}"
+    node_gpu_count: "{{ windowsnode.gpu_count | d('0', true) }}"
+    node_memory_size: "{{ windowsnode.mem_size | d('0', true) }}"
+    node_cpu_count: "{{ windowsnode.cpu_count | d('0', true) }}"
+    node_owner: "{{ windowsnode.requester | d('dpaas', true) }}"
+    node_env: "{{ windowsnode.env | d('dev', true) }}"
+    node_taint_value: "{{ windowsnode.taint_value | d('true', true) }}"
+    node_taint_key: "{{ windowsnode.taint_key | d('node.ocs.openshift/storage', true) }}"
+    windows_node_ami: "{{ windowsnode.ami }}"
+  loop: "{{ unique_aws_zones }}"
+  loop_control:
+    index_var: key_cnt
+  register: windowsnode.machineset_config_copied
+
+ #### Process cases where we need more than a single node in one availability zone  ###
+- name: '{{ ansible_name_module }} | duplicate availability zone adjustment'
+  when:
+    - missing_node_machine_count is defined
+    - missing_node_machine_count | int > 0
+  block:
+    - name: '{{ ansible_name_module }} | find | list of windows node machinesets'
+      ansible.builtin.find:
+        path: "{{ staging_dir | d('/tmp', true) }}/"
+        patterns: 'windows-az*machineset.yml'
+      register: windowsnode_machineset_file_list
+
+    - name: '{{ ansible_name_module }} | set_fact | created windows machinesets'
+      ansible.builtin.set_fact:
+        windowsnode_machineset_files_paths: "{{ windowsnode_machineset_file_list.files  | map(attribute='path') | list }}"
+
+    - name: '{{ ansible_name_module }} | replace | update replica count for first created windows machineset'
+      ansible.builtin.replace:
+        regexp: ' replicas: {{ windowsnode_replica_count_per_az }}'
+        replace: ' replicas: {{ total_windowsnode_az_one | int }}'
+        path: "{{ staging_dir | d('/tmp', true) }}/windows-az0-node-machineset.yml"
+
+#### End Processing cases where we need more than a single node in one availability zone  ###
+
+- name: '{{ ansible_name_module }} | ansible.builtin.command:{{ openshift_cli }} apply | deploy windows machinesets '
+  ansible.builtin.command: >
+    {{ openshift_cli }} apply -f {{ staging_dir | d('/tmp', true) }}/windows-az{{ key_cnt }}-node-machineset.yml
+  loop: "{{ unique_aws_zones }}"
+  loop_control:
+    index_var: key_cnt
+  register: windowsnode_machineset_created
+
+- name: '{{ ansible_name_module }} | wait_for | wait for machine to be created'
+  wait_for:
+    timeout: 210
+  delegate_to: localhost
+  
+## To properly function and reduce cost associated with these windows  resources we will use the cluster autoscaler to manage the machine autoscaler associated with each windows node  deployment
+- name: '{{ ansible_name_module }} | block | Ensure The cluster autoscaler is enabled'
+  when:
+    - add_node_to_autoscaler is defined
+    - add_node_to_autoscaler | bool
+  block:
+    - name: '{{ ansible_name_module }} | Check if  ClusterAutoscaler exist'
+      command: >
+        {{ openshift_cli }} get  clusterautoscalers.autoscaling.openshift.io default
+      ignore_errors: yes
+      register: clusterautoscaler_test
+
+    - name: '{{ ansible_name_module }} | template | Copy Cluster Autoscaler template to staging location'
+      template:
+        src: "../cluster_post-install_day_two/templates/clusterautoscaler.yml.j2"
+        dest: "{{ staging_dir | d('/tmp', true) }}/clusterautoscaler.yml"
+        force: yes
+      when:
+        - clusterautoscaler_test is defined
+        - clusterautoscaler_test.rc is defined
+        - clusterautoscaler_test.rc != "0"
+        - clusterautoscaler_test.stderr is defined
+        - '" not found" in clusterautoscaler_test.stderr '
+      register: clusterautoscaler_config_copied
+
+    - name: '{{ ansible_name_module }} | command:{{ openshift_cli }} apply | deploy cluster autoscaler '
+      command: >
+        {{ openshift_cli }} apply -f {{ staging_dir | d('/tmp', true) }}/clusterautoscaler.yml
+      when:
+        - clusterautoscaler_config_copied is defined
+        - clusterautoscaler_config_copied.dest is defined
+        - clusterautoscaler_config_copied.dest != ""
+      register: clusterautoscaler_config_deployed
+
+    - name: '{{ ansible_name_module }} | template | Copy windowsnode.machine autoscaler template to staging location'
+      template:
+        src: "templates/special-worker-node-machineautoscaler.yml.j2"
+        dest: "{{ staging_dir | d('/tmp', true) }}/{{ node_owner }}-az{{ windowsnode.instance_az | d(aws_zones[0], true) }}-windows-node-machineautoscaler.yml"
+        force: yes
+      vars:
+        infra_id: "{{ cluster_infra_id.stdout }}"
+        aws_az: "{{ windowsnode.instance_az | d(aws_zones[0], true) }}"
+        node_role: "{{ windowsnode.role | d('worker', true) }}"
+        node_owner: "{{ windowsnode.requester | d('dpaas', true) }}"
+        machineset_name: "{{ infra_id }}-{{ node_role }}-{{ node_owner }}-{{ aws_region }}{{ aws_az }}"
+        node_replica_count: "{{ windowsnode.node_count | default('1', true) }}"
+        machine_autoscaler_replica_min: 0
+        machine_autoscaler_replica_max: "{{ node_replica_count }}"
+      register: windowsnode_machine_autoscaler_config_copied
+
+    - name: '{{ ansible_name_module }} | command:{{ openshift_cli }} apply | deploy windows node machine autoscaler '
+      vars:
+        node_owner: "{{ windowsnode.requester | d('dpaas', true) }}"
+      command: >
+        {{ openshift_cli }} apply -f {{ staging_dir | d('/tmp', true) }}/{{ node_owner }}-az{{ windowsnode.instance_az | d(aws_zones[0], true) }}-windows-node-machineautoscaler.yml
+      register: windowsnode_machine_autoscaler_created
+
