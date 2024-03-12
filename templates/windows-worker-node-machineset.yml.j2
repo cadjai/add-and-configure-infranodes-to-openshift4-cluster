@@ -13,21 +13,21 @@ metadata:
 {% endif %}
   labels:
     machine.openshift.io/cluster-api-cluster: {{ infra_id }} 
-  name: {{ infra_id }}-{{ node_role }}-{{ node_owner }}-{{ aws_region }}{{ aws_az }}
+  name: {{ infra_id }}-windows-{{ node_role }}-{{ node_owner }}-{{ aws_region }}{{ aws_az }}
   namespace: openshift-machine-api
 spec:
   replicas: {{ node_replica_count }} 
   selector:
     matchLabels:
       machine.openshift.io/cluster-api-cluster: {{ infra_id }} 
-      machine.openshift.io/cluster-api-machineset: {{ infra_id }}-{{ node_role }}-{{ node_owner }}-{{ aws_region }}{{ aws_az }}
+      machine.openshift.io/cluster-api-machineset: {{ infra_id }}-windows-{{ node_role }}-{{ node_owner }}-{{ aws_region }}{{ aws_az }}
   template:
     metadata:
       labels:
         machine.openshift.io/cluster-api-cluster: {{ infra_id }} 
         machine.openshift.io/cluster-api-machine-role: {{ node_role }}
         machine.openshift.io/cluster-api-machine-type: {{ node_type }}
-        machine.openshift.io/cluster-api-machineset: {{ infra_id }}-{{ node_role }}-{{ node_owner }}-{{ aws_region }}{{ aws_az }}
+        machine.openshift.io/cluster-api-machineset: {{ infra_id }}-windows-{{ node_role }}-{{ node_owner }}-{{ aws_region }}{{ aws_az }}
         machine.openshift.io/os-id: Windows 
     spec:
       metadata: 
@@ -89,4 +89,5 @@ spec:
           - name: CLAP_OFF
             value: "20:00"
           userDataSecret:
-            name: worker-user-data
+            name: windows-user-data
+            namespace: openshift-machine-api

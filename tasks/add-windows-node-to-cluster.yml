@@ -2,8 +2,9 @@
   block:
     - ansible.builtin.assert:
         that:
-          - windowsnode.is defined and windowsnode.!= ""
+          - windowsnode is defined and windowsnode != ""
         msg: " the windowsnode.structure must be set and valid "
+
     - ansible.builtin.assert:
         that:
           - windowsnode.role is defined and windowsnode.role != ""
@@ -17,33 +18,108 @@
           - windowsnode.ami is defined and windowsnode.ami != ""
         msg: " the windowsnode.ami must be set and valid "
 
+    - name: '{{ ansible_name_module }} | ansible.builtin.shell:{{ openshift_cli }} get | get WMCO cat src cr'
+      ansible.builtin.shell: >
+        {{ openshift_cli }} get catalogsource -A --no-headers | grep -i windows | awk '{print $2}'
+      ignore_errors: true
+      register: wmco_catsrc_exists
+
+    - ansible.builtin.assert:
+        that:
+          - wmco_catsrc_exists is defined
+          - wmco_catsrc_exists.rc is defined
+          - wmco_catsrc_exists.rc == 0 
+          - wmco_catsrc_exists.stdout is defined
+          - wmco_catsrc_exists.stdout != '' 
+          - "'windows' in wmco_catsrc_exists.stdout"
+        msg: " the Windowns Operator Catalog Source must exist in the cluster"
+
+- name: '{{ ansible_name_module }} | ansible.builtin.shell:{{ openshift_cli }} get | get WMCO namespace'
+  ansible.builtin.shell: >
+    {{ openshift_cli }} get project {{ wmco_ns }} --no-headers | awk '{print $1}'
+  ignore_errors: true
+  register: wmco_ns_exists
+
+- name: '{{ ansible_name_module }} | Install windows machine Config Operator'
+  when:
+    - wmco_ns_exists is defined 
+    - wmco_ns_exists.stdout is defined 
+    - wmco_ns_exists.stdout != '' 
+    - "'windows' in wmco_ns_exists.stdout"
+  block:
     - name: '{{ ansible_name_module }} | ansible.builtin.shell:{{ openshift_cli }} get | get WMCO subscription cr'
       ansible.builtin.shell: >
         {{ openshift_cli }} get sub -A --no-headers | grep windows | awk '{print $2}'
       ignore_errors: true
       register: wmco_sub_exists
 
-    - name: '{{ ansible_name_module }} | ansible.builtin.shell:{{ openshift_cli }} get | get WMCO subscription cr namespace'
+    - name: '{{ ansible_name_module }} | ansible.builtin.shell:{{ openshift_cli }} get | get WMCO OG cr namespace'
       ansible.builtin.shell: >
-        {{ openshift_cli }} get sub -A --no-headers | grep windows | awk '{print $1}'
+        {{ openshift_cli }} get og -A --no-headers | grep windows | awk '{print $1}'
       ignore_errors: true
-      register: wmco_sub_ns
+      register: wmco_og_exists
 
-    - name: '{{ ansible_name_module }} | ansible.builtin.shell:{{ openshift_cli }} get | get WMCO namespace'
+- name: '{{ ansible_name_module }} | Install windows machine Config Operator'
+  when:
+    - (wmco_ns_exists.stderr is defined  and wmco_ns_exists.stderr != '') or (wmco_sub_exists.stdout is defined and wmco_sub_exists.stdout == '' and wmco_og_exists.stdout is defined and wmco_og_exists.stdout == '')
+  block:
+    - name: '{{ ansible_name_module }} | ansible.builtin.command:{{ openshift_cli }} patch | patch network '
+      ansible.builtin.command: >
+        {{ openshift_cli }} patch networks.operator.openshift.io cluster --type=merge \
+        -p '{"spec":{"defaultNetwork":{"ovnKubernetesConfig":{"hybridOverlayConfig":{"hybridClusterNetwork":[{"cidr": "{{ wnco_cidr }}", "hostPrefix": {{ wnco_host_prefix }}}]}}}}}' 
+      register: cluster_networks_patched 
+
+    - name: '{{ ansible_name_module }} | Deploy Operators | Create Operator Namespace'
+      ansible.builtin.command: >
+        {{ openshift_cli }} create namespace '{{ wmcoperator.deploy_namespace }}'
+      failed_when: "operator_ns_created.rc >=1 and not ' already exists' in operator_ns_created.stderr"
+      register: operator_ns_created
+
+    - name: '{{ ansible_name_module }} | command:{{ openshift_cli }} patch | namespace add labels'
+      ansible.builtin.command: >
+        {{ openshift_cli }} patch namespace {{ wmcoperator.deploy_namespace }} --type merge -p '{"metadata":{"labels": {{ wmcoperator.patch_namespace_labels }} }}'
+      register: operator_ns_patched
+
+    - name: '{{ ansible_name_module }} | template | Copy OperatorGroup Config to staging location'
+      ansible.builtin.template:
+        src: "templates/OperatorGroup.yml.j2"
+        dest: "{{ staging_dir | d('/tmp', true) }}/{{ wmcoperator.name }}-OperatorGroup.yml"
+        force: yes
+      vars:
+        operator_group_name: "{{ wmcoperator.group_name }}"
+        operator_deploy_namespace: "{{ wmcoperator.deploy_namespace }}"
+        operator_target_namespace: "{{ wmcoperator.target_namespace }}"
+        operator_name: "{{ wmcoperator.name }}"
+      register: op_csc_copied
+
+    - name: '{{ ansible_name_module }} | command:{{ openshift_cli }} apply | deploy operatorgroup '
+      ansible.builtin.command: >
+        {{ openshift_cli }} apply -f {{ staging_dir | d('/tmp', true) }}/{{ wmcoperator.name }}-OperatorGroup.yml
+      register: op_csc_deployed
+
+    - name: '{{ ansible_name_module }} | shell:{{ openshift_cli }} | Get package manifest for each operator'
       ansible.builtin.shell: >
-        {{ openshift_cli }} get project {{ wmco_ns }} --no-headers | awk '{print $1}'
-      ignore_errors: true
-      register: wmco_ns
+        {{ openshift_cli }} get packagemanifest {{ wmcoperator.name }} -ojsonpath='{.status.channels[-1].currentCSV}{"\n"}{.status.defaultChannel}{"\n"}'
+      register: operator_pkg_info
 
-    - name: '{{ ansible_name_module }} | assert | WMCO is properly installed'
-      ansible.builtin.assert:
-        that:
-          - wmco_sub_exists is defined
-          - wmco_sub_exists.rc is defined
-          - wmco_sub_exists.rc == 0
-          - wmco_sub_exists.stdout is defined
-          - "'devspaces' in wmco_sub_exists.stdout"
-        msg: "The WMCO operator is required before running this"
+    - name: '{{ ansible_name_module }} | template | Copy Operator Subscripion to staging location'
+      ansible.builtin.template:
+        src: "templates/Subscription.yml.j2"
+        dest: "{{ staging_dir | d('/tmp', true) }}/{{ wmcoperator.name }}-Subscription.yml"
+        force: yes
+      vars:
+        operator_catalog_name: "{{ wmcoperator.catalog_name }}"
+        operator_target_namespace: "{{ wmcoperator.target_namespace }}"
+        operator_deploy_namespace: "{{ wmcoperator.deploy_namespace }}"
+        operator_name: "{{ wmcoperator.name }}"
+        operator_sub_channel: "{{ operator_pkg_info.stdout_lines[1] }}"
+        operator_csv_version: "{{ operator_pkg_info.stdout_lines[0] }}"
+      register: op_sub_copied
+
+    - name: '{{ ansible_name_module }} | command:{{ openshift_cli }} apply | deploy operator subscription'
+      ansible.builtin.command: >
+        {{ openshift_cli }} apply -f {{ staging_dir | d('/tmp', true) }}/{{ wmcoperator.name }}-Subscription.yml
+      register: op_sub_deployed
 
 - name: '{{ ansible_name_module }} | Generate SSH key for windows nodes'
   block:
@@ -51,15 +127,21 @@
       ansible.builtin.file:
         path: '{{ item }}'
         state: directory
-        mode: '0644'
+        #mode: '0644'
+        #group: "{{ lookup('env', 'USER') }}"
+        #owner: "{{ lookup('env', 'USER') }}" 
       with_items:
-        - '{{ ssh_key_dir }}/ssh'
+        - '{{ ssh_key_dir }}'
 
     - name: '{{ ansible_name_module }} | ssh | openssh_keypair | Generate CloudCtl SSH Key Pair'
+      #become: yes
       community.crypto.openssh_keypair:
-        path: "{{ ssh_key_dir }}/ssh/{{ ssh_key_name }}"
-        type: 'ed25519'
+        path: "{{ ssh_key_dir }}/{{ ssh_key_name }}"
+        #type: 'ed25519'
         comment: "core@ocp.kubeadmin"
+        #mode: '0644'
+        #group: "{{ lookup('env', 'USER') }}"
+        #owner: "{{ lookup('env', 'USER') }}" 
       register: ssh_key_created 
 
     - name: '{{ ansible_name_module }} | Get Existing RHBK KS secret'
@@ -71,7 +153,7 @@
     - name: '{{ ansible_name_module }} | create RHBK KS secret'
       ansible.builtin.command: >
         {{ openshift_cli }} create secret generic {{ ssh_key_secret }} \
-          --from-file=private-key.pem={{ ssh_key_dir }}/ssh/{{ ssh_key_name }} -n {{ wmco_ns }}
+          --from-file=private-key.pem={{ ssh_key_dir }}/{{ ssh_key_name }} -n {{ wmco_ns }}
       when:
         - wmco_ssh_key_secret_exist.rc is defined
         - wmco_ssh_key_secret_exist.rc != 0
@@ -144,10 +226,10 @@
     node_taint_value: "{{ windowsnode.taint_value | d('true', true) }}"
     node_taint_key: "{{ windowsnode.taint_key | d('node.ocs.openshift/storage', true) }}"
     windows_node_ami: "{{ windowsnode.ami }}"
-  loop: "{{ unique_aws_zones }}"
+  loop: "{{ range(0, windowsnode.instance_count, 1) }}"
   loop_control:
     index_var: key_cnt
-  register: windowsnode.machineset_config_copied
+  register: windowsnode_machineset_config_copied
 
  #### Process cases where we need more than a single node in one availability zone  ###
 - name: '{{ ansible_name_module }} | duplicate availability zone adjustment'
@@ -176,7 +258,7 @@
 - name: '{{ ansible_name_module }} | ansible.builtin.command:{{ openshift_cli }} apply | deploy windows machinesets '
   ansible.builtin.command: >
     {{ openshift_cli }} apply -f {{ staging_dir | d('/tmp', true) }}/windows-az{{ key_cnt }}-node-machineset.yml
-  loop: "{{ unique_aws_zones }}"
+  loop: "{{ range(0, windowsnode.instance_count, 1) }}"
   loop_control:
     index_var: key_cnt
   register: windowsnode_machineset_created
@@ -230,7 +312,7 @@
         aws_az: "{{ windowsnode.instance_az | d(aws_zones[0], true) }}"
         node_role: "{{ windowsnode.role | d('worker', true) }}"
         node_owner: "{{ windowsnode.requester | d('dpaas', true) }}"
-        machineset_name: "{{ infra_id }}-{{ node_role }}-{{ node_owner }}-{{ aws_region }}{{ aws_az }}"
+        machineset_name: "{{ infra_id }}-windows-{{ node_role }}-{{ node_owner }}-{{ aws_region }}{{ aws_az }}"
         node_replica_count: "{{ windowsnode.node_count | default('1', true) }}"
         machine_autoscaler_replica_min: 0
         machine_autoscaler_replica_max: "{{ node_replica_count }}"
