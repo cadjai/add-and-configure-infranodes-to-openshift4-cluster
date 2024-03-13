@@ -325,3 +325,54 @@
         {{ openshift_cli }} apply -f {{ staging_dir | d('/tmp', true) }}/{{ node_owner }}-az{{ windowsnode.instance_az | d(aws_zones[0], true) }}-windows-node-machineautoscaler.yml
       register: windowsnode_machine_autoscaler_created
 
+      ### Configure Runtime class for windows nodes
+- name: '{{ ansible_name_module }} | block | Ensure The RuntimeClass is enabled for Windows nodes'
+  block:
+    - name: '{{ ansible_name_module }} | command:{{ openshift_cli }} get machine | get windows machine'
+      ansible.builtin.shell: >
+        {{ openshift_cli }} get machine --no-headers -n openshift-machine-api | grep windows | awk '{print $1}'
+      register: windowsnode_machines
+
+    - name: '{{ ansible_name_module }} | command:{{ openshift_cli }} get machine | get windows machine node names'
+      ansible.builtin.command: >
+        {{ openshift_cli }} get machine {{ item }} -o=jsonpath='{.status.nodeRef.name}{"\n"}' -n openshift-machine-api
+      when:
+        - windowsnode_machines is defined
+        - windowsnode_machines.rc == 0
+        - windowsnode_machines.stdout_lines is defined
+        - windowsnode_machines.stdout_lines != ""
+      loop: "{{ windowsnode_machines.stdout_lines }}"
+      register: windowsnode_node_names
+
+    - name: '{{ ansible_name_module }} | command:{{ openshift_cli }} | Retrieve node labels'
+      ansible.builtin.shell: >
+        {{ openshift_cli }}  get node {{ item.stdout }} -o jsonpath='{.metadata.labels}' | jq . 
+      loop: "{{ windowsnode_node_names.results }}"
+      register: windowsnode_node_labels 
+
+    - name: '{{ ansible_name_module }} | command:{{ openshift_cli }} | Retrieve node taints'
+      ansible.builtin.shell: >
+        {{ openshift_cli }}  get node {{ item.stdout }} -o jsonpath='{.spec.taints}' | jq . 
+      loop: "{{ windowsnode_node_names.results }}"
+      register: windowsnode_node_taints 
+
+    - name: '{{ ansible_name_module }} | template | Copy windowsnode runtime class template to staging location'
+      ansible.builtin.set_fact:
+        windows_node_labels: "{{ windowsnode_node_labels.results[0].stdout | from_json }}"
+        windows_node_taints: "{{ windowsnode_node_taints.results[0].stdout | from_json }}"
+        windows_build_label: "{{ (windowsnode_node_labels.results[0].stdout | from_json)['node.kubernetes.io/windows-build'] }}"
+
+    - name: '{{ ansible_name_module }} | template | Copy windowsnode runtime class template to staging location'
+      ansible.builtin.template:
+        src: "templates/windows-runtime-class.yaml.j2"
+        dest: "{{ staging_dir | d('/tmp', true) }}/windows-runtime-class.yaml"
+        force: yes
+      vars:
+        node_role: "{{ windowsnode.role }}"
+      register: windowsnode_runtimeclass_created 
+
+    - name: '{{ ansible_name_module }} | command:{{ openshift_cli }} apply | deploy windows runtime class'
+      ansible.builtin.command: >
+        {{ openshift_cli }} apply -f {{ staging_dir | d('/tmp', true) }}/windows-runtime-class.yaml
+      register: windowsnode_runtimeclass_applied 
+
