@@ -1,0 +1,8 @@
+{
+    "hosts":  [
+                  "npipe://"
+              ],
+    "insecure-registries": ["{{ registry_host_fqdn }}","default-route-openshift-image-registry{{ cluster_base_domain }}"],
+    "allow-nondistributable-artifacts": ["{{ registry_host_fqdn }}","default-route-openshift-image-registry{{ cluster_base_domain }}"],
+    "debug": true
+}

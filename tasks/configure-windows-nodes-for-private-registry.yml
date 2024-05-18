@@ -1,0 +1,137 @@
+- name: '{{ ansible_name_module }} | command:{{ openshift_cli }} get cluster base domain'
+  ansible.builtin.shell: >
+    {{ openshift_cli }} whoami --show-console 
+  register: cluster_console_url 
+
+- name: '{{ ansible_name_module }} | template | Copy windowsnode runtime class template to staging location'
+  ansible.builtin.set_fact:
+    cluster_base_domain: "{{ cluster_console_url.stdout.split('console-openshift-console')[1] }}"
+
+- name: '{{ ansible_name_module }} | command:{{ openshift_cli }} get machine | get windows machine'
+  ansible.builtin.shell: >
+    {{ openshift_cli }} get machine --no-headers -n openshift-machine-api | grep windows | awk '{print $1}'
+  register: windowsnode_machines
+
+- name: '{{ ansible_name_module }} | command:{{ openshift_cli }} get machine | get windows machine node IPs'
+  ansible.builtin.command: >
+    {{ openshift_cli }} get machine {{ item }}  -o=jsonpath='{.status.addresses[0].address}{"\n"}' \
+       -n openshift-machine-api
+  loop: "{{ windowsnode_machines.stdout_lines }}"
+  register: windowsnode_ips
+
+- name: '{{ ansible_name_module }} | file:directory | Ensure the staging directory exist'
+  become: yes
+  ansible.builtin.file:
+    path: "{{ staging_dir | d('/tmp/windows-node', true) }}"
+    state: directory
+    mode: 0777
+
+- name: '{{ ansible_name_module }} | command:{{ openshift_cli }} Retrieve node ssh key'
+  ansible.builtin.shell: >
+    {{ openshift_cli }} extract secret/{{ ssh_key_secret | default('cloud-private-key', true) }} \
+      -n openshift-windows-machine-config-operator --to  {{ staging_dir | d('/tmp/windows-node', true) }} \
+       --confirm
+  ignore_errors: yes
+  failed_when:
+    - node_ssh_retrieved.rc >= 1
+    - not 'file exists' in node_ssh_retrieved.stderr
+  register: node_ssh_retrieved
+
+- name: '{{ ansible_name_module }} | template | Copy daemon.json to staging location'
+  ansible.builtin.template:
+    src: "templates/daemon.json.j2"
+    dest: "{{ staging_dir | d('/tmp/windows-node', true) }}/daemon.json"
+    force: yes
+  register: daemon_json_copied
+
+- name: '{{ ansible_name_module }} | command | generate authfile for registry'
+  ansible.builtin.command: >
+    podman login -u {{ registry_admin_username }} -p {{ registry_admin_password }} \
+       --authfile {{ staging_dir | d('/tmp/windows-node', true) }}/config.json \
+       {{ registry_host_fqdn }}
+  register: reg_authfile_created
+
+- name: '{{ ansible_name_module }} | shell:ssh | Configure administrator RDP password'
+  ansible.builtin.shell: >
+    ssh -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' administrator@{{ item.stdout }} "net user administrator {{ admin_user_pwd }}"
+  loop: "{{ windowsnode_ips.results }}"
+  register: admin_user_pwd_created
+
+- name: '{{ ansible_name_module }} | shell:ssh | Create .docker under the administrator user home'
+  ansible.builtin.shell: >
+    ssh -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' administrator@{{ item.stdout }} "mkdir .docker"
+  loop: "{{ windowsnode_ips.results }}"
+  ignore_errors: yes
+  failed_when:
+    - docker_dir_created.rc >= 1
+    - not 'already exists' in docker_dir_created.stderr
+  register: docker_dir_created
+
+- name: '{{ ansible_name_module }} | shell:ssh | Copy docker daemon script to node'
+  ansible.builtin.shell: >
+    scp -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' files/install* administrator@{{ item.stdout }}:./
+  loop: "{{ windowsnode_ips.results }}"
+  register: docker_script_copied
+
+- name: '{{ ansible_name_module }} | shell:ssh | Copy docker daemon script to node'
+  ansible.builtin.shell: >
+    scp -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' {{ staging_dir | d('/tmp/windows-node', true) }}/config.json \
+    administrator@{{ item.stdout }}:/C:/Users/administrator/.docker/
+  loop: "{{ windowsnode_ips.results }}"
+  register: docker_config_copied
+
+- name: '{{ ansible_name_module }} | shell:ssh | Run the docker daemon install script on nodes'
+  ansible.builtin.shell: >
+    ssh -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' administrator@{{ item.stdout }} powershell \
+      -Command \"\.\\install-docker-ce.ps1\"
+  loop: "{{ windowsnode_ips.results }}"
+  register: docker_dir_created
+
+- name: '{{ ansible_name_module }} | shell:ssh | Copy docker daemon script to node'
+  ansible.builtin.shell: >
+    scp -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no'  {{ staging_dir | d('/tmp/windows-node', true) }}/daemon.json \
+       administrator@{{ item.stdout }}:/C:/ProgramData/docker/config
+  loop: "{{ windowsnode_ips.results }}"
+  register: daemon_config_copied
+
+- name: '{{ ansible_name_module }} | shell:ssh | Restart docker daemon on nodes'
+  ansible.builtin.shell: >
+    ssh -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' administrator@{{ item.stdout }} powershell \
+      -Command \"Restart-Service docker\"
+  loop: "{{ windowsnode_ips.results }}"
+  register: docker_svc_restarted
+
+- name: '{{ ansible_name_module }} | shell:ssh | Get docker daemon service status on nodes'
+  ansible.builtin.shell: >
+    ssh -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' administrator@{{ item.stdout }} powershell \
+      -Command \"Get-Service docker\"
+  loop: "{{ windowsnode_ips.results }}"
+  register: docker_status_retrieved
+
+- name: '{{ ansible_name_module }} | shell:ssh | Get docker version on nodes'
+  ansible.builtin.shell: >
+    ssh -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' administrator@{{ item.stdout }} powershell \
+      -Command \"docker --version\"
+  loop: "{{ windowsnode_ips.results }}"
+  register: docker_ver_retrieved
+
+- name: '{{ ansible_name_module }} | shell:ssh | Test image pull on nodes'
+  ansible.builtin.shell: >
+    ssh -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' administrator@{{ item.stdout }} powershell \
+      -Command \"docker pull {{ registry_host_fqdn }}/{{ local_repository }}/oss/kubernetes/pause:3.9\"
+  loop: "{{ windowsnode_ips.results }}"
+  register: pause_image_pulled
+
+- name: '{{ ansible_name_module }} | shell:ssh | Test image pull on nodes'
+  ansible.builtin.shell: >
+    ssh -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' administrator@{{ item.stdout }} powershell \
+      -Command \"docker pull {{ registry_host_fqdn }}/{{ local_repository }}/windows/servercore:ltsc2022\"
+  loop: "{{ windowsnode_ips.results }}"
+  register: servercore_image_pulled
+
+#- name: '{{ ansible_name_module }} | shell:ssh | Test docker run  on nodes'
+#  ansible.builtin.shell: >
+#    ssh -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' administrator@{{ item.stdout }} powershell \
+#      -Command \"docker run --name aspnet_sample --rm -it -p 8000:80 {{ registry_host_fqdn }}/{{ local_repository }}/dotnet/framework/samples:aspnetapp\"
+#  loop: "{{ windowsnode_ips.results }}"
+#  register: docker_run_test
