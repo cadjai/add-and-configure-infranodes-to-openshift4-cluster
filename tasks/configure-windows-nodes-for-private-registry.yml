@@ -51,6 +51,17 @@
        {{ registry_host_fqdn }}
   register: reg_authfile_created
 
+- name: '{{ ansible_name_module }} | command:{{ openshift_cli }} Retrieve cluster CA Bundle'
+  ansible.builtin.shell: >
+    {{ openshift_cli }} extract cm/{{ cluster_ca_bundle_cm | default('user-ca-bundle', true) }} \
+      -n openshift-config --to {{ staging_dir | d('/tmp/windows-node', true) }} \
+       --confirm
+  ignore_errors: yes
+  failed_when:
+    - cluster_cabundle_retrieved.rc >= 1
+    - not 'file exists' in cluster_cabundle_retrieved.stderr
+  register: cluster_cabundle_retrieved
+
 - name: '{{ ansible_name_module }} | shell:ssh | Configure administrator RDP password'
   ansible.builtin.shell: >
     ssh -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' administrator@{{ item.stdout }} "net user administrator {{ admin_user_pwd }}"
@@ -66,6 +77,16 @@
     - docker_dir_created.rc >= 1
     - not 'already exists' in docker_dir_created.stderr
   register: docker_dir_created
+
+- name: '{{ ansible_name_module }} | shell:ssh | Create certs under the administrator user home'
+  ansible.builtin.shell: >
+    ssh -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' administrator@{{ item.stdout }} "mkdir -p certs"
+  loop: "{{ windowsnode_ips.results }}"
+  ignore_errors: yes
+  failed_when:
+    - certs_dir_created.rc >= 1
+    - not 'already exists' in certs_dir_created.stderr
+  register: certs_dir_created
 
 - name: '{{ ansible_name_module }} | shell:ssh | Copy docker daemon script to node'
   ansible.builtin.shell: >
@@ -85,7 +106,7 @@
     ssh -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' administrator@{{ item.stdout }} powershell \
       -Command \"\.\\install-docker-ce.ps1\"
   loop: "{{ windowsnode_ips.results }}"
-  register: docker_dir_created
+  register: docker_daemon_installed
 
 - name: '{{ ansible_name_module }} | shell:ssh | Copy docker daemon script to node'
   ansible.builtin.shell: >
@@ -101,6 +122,20 @@
   loop: "{{ windowsnode_ips.results }}"
   register: docker_svc_restarted
 
+- name: '{{ ansible_name_module }} | shell:ssh | Copy ca bundle to node'
+  ansible.builtin.shell: >
+    scp -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' {{ staging_dir | d('/tmp/windows-node', true) }}/{{ cluster_cabundle_name | default('ca-bundle.crt', true) }} \
+    administrator@{{ item.stdout }}:/C:/Users/administrator/certs/
+  loop: "{{ windowsnode_ips.results }}"
+  register: cabundle_copied
+
+- name: '{{ ansible_name_module }} | shell:ssh | Trust CA Bundle on nodes'
+  ansible.builtin.shell: >
+    ssh -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' administrator@{{ item.stdout }} powershell \
+      -Command \"certutil -f -addstore root C:\\Users\\Administrator\\certs\\{{ cluster_cabundle_name | default('ca-bundle.crt', true) }}\"
+  loop: "{{ windowsnode_ips.results }}"
+  register: ca_bundle_trusted
+
 - name: '{{ ansible_name_module }} | shell:ssh | Get docker daemon service status on nodes'
   ansible.builtin.shell: >
     ssh -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' administrator@{{ item.stdout }} powershell \
@@ -115,14 +150,14 @@
   loop: "{{ windowsnode_ips.results }}"
   register: docker_ver_retrieved
 
-- name: '{{ ansible_name_module }} | shell:ssh | Test image pull on nodes'
+- name: '{{ ansible_name_module }} | shell:ssh | Pull kubernetes Pause image on nodes'
   ansible.builtin.shell: >
     ssh -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' administrator@{{ item.stdout }} powershell \
       -Command \"docker pull {{ registry_host_fqdn }}/{{ local_repository }}/oss/kubernetes/pause:3.9\"
   loop: "{{ windowsnode_ips.results }}"
   register: pause_image_pulled
 
-- name: '{{ ansible_name_module }} | shell:ssh | Test image pull on nodes'
+- name: '{{ ansible_name_module }} | shell:ssh | Pull servercore image on nodes'
   ansible.builtin.shell: >
     ssh -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' administrator@{{ item.stdout }} powershell \
       -Command \"docker pull {{ registry_host_fqdn }}/{{ local_repository }}/windows/servercore:ltsc2022\"
