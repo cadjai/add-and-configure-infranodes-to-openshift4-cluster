@@ -129,9 +129,9 @@
   loop: "{{ windowsnode_ips.results }}"
   register: servercore_image_pulled
 
-#- name: '{{ ansible_name_module }} | shell:ssh | Test docker run  on nodes'
-#  ansible.builtin.shell: >
-#    ssh -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' administrator@{{ item.stdout }} powershell \
-#      -Command \"docker run --name aspnet_sample --rm -it -p 8000:80 {{ registry_host_fqdn }}/{{ local_repository }}/dotnet/framework/samples:aspnetapp\"
-#  loop: "{{ windowsnode_ips.results }}"
-#  register: docker_run_test
+- name: '{{ ansible_name_module }} | shell:ssh | Test docker run  on nodes'
+  ansible.builtin.shell: >
+    ssh -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' administrator@{{ item.stdout }} powershell \
+      -Command \"docker run --name aspnet_sample --rm -d -p 8000:80 {{ registry_host_fqdn }}/{{ local_repository }}/dotnet/framework/samples:aspnetapp\"
+  loop: "{{ windowsnode_ips.results }}"
+  register: docker_run_test
