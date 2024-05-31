@@ -136,6 +136,21 @@
   loop: "{{ windowsnode_ips.results }}"
   register: ca_bundle_trusted
 
+- name: '{{ ansible_name_module }} | shell:ssh | Trust CA Bundle into NTAuth on nodes'
+  ansible.builtin.shell: >
+    ssh -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' administrator@{{ item.stdout }} powershell \
+      -Command \"certutil -enterprise -addstore NTAuth C:\\Users\\Administrator\\certs\\{{ cluster_cabundle_name | default('ca-bundle.crt', true) }}\"
+  loop: "{{ windowsnode_ips.results }}"
+  register: ca_bundle_trusted
+
+#- name: '{{ ansible_name_module }} | shell:ssh | Import CA Bundle into NTAuth on nodes'
+#  ansible.builtin.shell: >
+#    ssh -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' administrator@{{ item.stdout }} powershell \
+#      -Command \"certutil -dspublish -f C:\\Users\\Administrator\\certs\\{{ cluster_cabundle_name | default('ca-bundle.crt', true) }} NTAuthCA\"
+#  loop: "{{ windowsnode_ips.results }}"
+#  register: ca_bundle_trusted
+
+
 - name: '{{ ansible_name_module }} | shell:ssh | Get docker daemon service status on nodes'
   ansible.builtin.shell: >
     ssh -i {{ staging_dir | d('/tmp/windows-node', true) }}/private-key.pem -o 'StrictHostKeyChecking no' administrator@{{ item.stdout }} powershell \
